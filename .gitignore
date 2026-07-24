@@ -1,0 +1,24 @@
+# Environment variables
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Memory & data (user data -- never commit)
+database/memory.json
+database/memory_test.json
+database/reminders.json
+database/journal.json
+database/notifications.json
+database/learning.json
+database/power_tools.json
+aisha_state_*.json.gz
+
+# Node
+frontend/node_modules/
+
+# IDE
+.vscode/
+.idea/

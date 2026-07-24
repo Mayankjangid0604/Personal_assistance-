@@ -1,0 +1,87 @@
+/* ================================================================
+   Aisha AI Assistant -- Global Design Tokens & Base Styles
+   ================================================================ */
+
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
+
+/* ---- Design Tokens ---- */
+:root {
+  /* Background / Surface */
+  --bg-primary:     #0d0d12;
+  --bg-secondary:   #16161e;
+  --bg-surface:     #1e1e2a;
+  --bg-elevated:    #252536;
+  --bg-hover:       #2a2a3e;
+
+  /* Accent */
+  --accent:         #7c5cfc;
+  --accent-hover:   #9278ff;
+  --accent-glow:    rgba(124, 92, 252, 0.25);
+  --accent-soft:    rgba(124, 92, 252, 0.10);
+
+  /* Text */
+  --text-primary:   #e8e6f0;
+  --text-secondary: #9b97b0;
+  --text-muted:     #605c78;
+
+  /* Aisha's messages */
+  --aisha-bg:       linear-gradient(135deg, #1f1d35 0%, #262340 100%);
+  --aisha-border:   rgba(124, 92, 252, 0.15);
+
+  /* User's messages */
+  --user-bg:        linear-gradient(135deg, #7c5cfc 0%, #6244e0 100%);
+  --user-text:      #ffffff;
+
+  /* Misc */
+  --border:         rgba(255, 255, 255, 0.06);
+  --shadow:         0 4px 24px rgba(0, 0, 0, 0.35);
+  --radius:         14px;
+  --radius-sm:      10px;
+
+  /* Typography */
+  --font:           'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+}
+
+/* ---- Reset ---- */
+*,
+*::before,
+*::after {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+html, body, #root {
+  height: 100%;
+  width: 100%;
+  overflow: hidden;
+}
+
+body {
+  font-family: var(--font);
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* Scrollbar */
+::-webkit-scrollbar {
+  width: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--text-muted);
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--text-secondary);
+}
+
+/* Selection */
+::selection {
+  background: var(--accent);
+  color: #fff;
+}
