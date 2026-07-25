@@ -1,42 +1,54 @@
 """
 LLM Router for Aisha AI Assistant.
 
-Gemini-primary with local fallback.  Two-tier decision:
+Phase 9 update: this module is now a thin, **fully backward-compatible**
+facade over the vendor-neutral provider platform in :mod:`providers`.  Every
+function that existed before keeps its exact signature and behaviour; the
+routing underneath now understands multiple providers and local models.
 
-    Tier 1 -- Simple queries (greetings, short text, casual chat)
-              are handled instantly by the local response_generator.
-              No API call is made.
+Two-tier decision (unchanged semantics)
+---------------------------------------
+    Tier 1 -- Simple queries (greetings, short text, casual chat) are handled
+              instantly by the local response_generator.  No model call.
 
-    Tier 2 -- Complex queries (explanations, questions, learning,
-              coding, long-form input) are sent to Google Gemini.
-              If Gemini fails, the system falls back to the local
-              response_generator automatically.
+    Tier 2 -- Complex queries are routed by the provider registry:
+                  local Ollama model (by task)  ->  Gemini  ->  rule-based.
+              With no local models and no Gemini keys this collapses to the
+              original "complex -> Gemini, else local fallback" behaviour.
 
-Setup:
-    Add your Gemini key(s) to ``.env`` in the project root::
+Setup (unchanged)::
 
         GEMINI_API_KEY=your_key_here
         GEMINI_API_KEY_1=your_key_here
         GEMINI_API_KEY_2=optional_backup_key
 
-Usage::
+Usage (unchanged)::
 
     from llm_router import generate_ai_response
+    response = generate_ai_response("Explain recursion", {"user_name": "Mayank"})
 
-    response = generate_ai_response(
-        user_input="Explain recursion in detail",
-        context={"user_name": "Mayank", "emotion": "curious"},
-    )
+New (Phase 9)::
+
+    from llm_router import llm_router          # singleton facade
+    text = llm_router.generate_ai_response(prompt, system_prompt="...", task="reasoning")
 """
 
 from __future__ import annotations
 
 import os
-import re
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 from dotenv import load_dotenv
+
+# Provider platform (lower layer -- no circular import).
+from providers import get_registry, TaskType
+from providers.gemini_provider import (
+    GeminiProvider,
+    build_gemini_prompt as _build_gemini_prompt,   # re-exported for compat
+    is_real_key as _is_real_key,                    # re-exported for compat
+    load_gemini_keys as _load_gemini_keys,          # re-exported for compat
+)
 
 
 # ---------------------------------------------------------------------------
@@ -50,70 +62,27 @@ if _ENV_PATH.exists():
     load_dotenv(_ENV_PATH)
 
 
-# ---------------------------------------------------------------------------
-# Gemini Key Loading  (multi-key support)
-# ---------------------------------------------------------------------------
-
-def _is_real_key(key: str | None) -> bool:
-    """Return True only if *key* is set and isn't a placeholder."""
-    if not key:
-        return False
-    placeholders = {"", "your_gemini_key_here", "YOUR_KEY_HERE", "sk-xxx"}
-    return key.strip() not in placeholders
-
-
-def _load_gemini_keys(max_slots: int = 10) -> list[str]:
-    """
-    Load all valid Gemini API keys from environment variables.
-
-    Checks ``GEMINI_API_KEY`` (legacy) and ``GEMINI_API_KEY_1`` through
-    ``GEMINI_API_KEY_{max_slots}``.  Returns a de-duplicated list.
-    """
-    seen: set[str] = set()
-    keys: list[str] = []
-
-    # Legacy single-key variable
-    legacy = os.environ.get("GEMINI_API_KEY")
-    if _is_real_key(legacy) and legacy.strip() not in seen:
-        keys.append(legacy.strip())
-        seen.add(legacy.strip())
-
-    # Numbered slots
-    for i in range(1, max_slots + 1):
-        val = os.environ.get(f"GEMINI_API_KEY_{i}")
-        if _is_real_key(val) and val.strip() not in seen:
-            keys.append(val.strip())
-            seen.add(val.strip())
-
-    return keys
-
-
+# Backward-compatible module-level key list (kept in sync with the provider).
 GEMINI_KEYS: list[str] = _load_gemini_keys()
 
 
 # ---------------------------------------------------------------------------
-# Simple-Query Detection
+# Simple-Query Detection (unchanged)
 # ---------------------------------------------------------------------------
 
 _SIMPLE_EXACT: set[str] = {
-    # Greetings
     "hi", "hello", "hey", "yo", "sup", "hii", "hiii",
     "namaste", "salam", "howdy", "wassup", "what's up",
-    # Thanks
     "thanks", "thank you", "thankyou", "thx", "ty",
-    # Acknowledgements
     "ok", "okay", "k", "kk", "sure", "yes", "no", "yep", "nope",
-    # Farewells
     "bye", "goodbye", "good night", "good morning", "good evening",
     "gm", "gn", "good afternoon",
-    # Fillers / reactions
     "hmm", "hm", "ah", "oh", "wow", "lol", "haha", "hehe",
     "nice", "cool", "great", "awesome", "amazing",
 }
 
 _SIMPLE_MAX_WORDS = 4
 
-# Keywords that signal a complex query even if the message is short.
 _COMPLEX_SIGNALS: set[str] = {
     "code", "program", "debug", "explain", "algorithm",
     "function", "error", "fix", "write", "build", "create",
@@ -127,9 +96,8 @@ def is_simple_query(user_input: str) -> bool:
     """
     Determine whether *user_input* is simple enough to answer locally.
 
-    Returns ``True`` (use local) when:
-    - Input exactly matches a known greeting / filler, OR
-    - Input is very short (<= 4 words) with no complex-signal keywords.
+    Returns ``True`` when the input exactly matches a known greeting/filler,
+    or is very short (<= 4 words) with no complex-signal keywords.
     """
     normalised = user_input.lower().strip().rstrip("!?.,'\"")
 
@@ -145,115 +113,87 @@ def is_simple_query(user_input: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Prompt Builder
+# Task Detection (Phase 9 -- picks the right local model)
 # ---------------------------------------------------------------------------
 
-def _build_gemini_prompt(user_input: str, context: dict[str, Any]) -> str:
-    """Build a single prompt string for Gemini from user input + context."""
-    name = context.get("user_name", "User")
-    emotion = context.get("emotion", "neutral")
-    role = context.get("role", "assistant")
+_CODING_SIGNALS = {
+    "code", "program", "debug", "function", "bug", "error", "fix",
+    "python", "javascript", "java", "html", "css", "sql", "regex",
+    "compile", "stack trace", "refactor", "unit test", "api",
+}
+_REASONING_SIGNALS = {
+    "why", "explain", "prove", "analyze", "analyse", "reason",
+    "compare", "difference", "trade-off", "tradeoff", "evaluate",
+    "pros and cons", "logic", "solve",
+}
+_PLANNING_SIGNALS = {
+    "plan", "schedule", "roadmap", "steps", "organize", "organise",
+    "strategy", "milestone", "timeline", "break down", "outline",
+    "prioritize", "prioritise",
+}
 
-    # Recent chat history for continuity
-    history_block = ""
-    chat_history = context.get("chat_history", [])
-    if chat_history:
-        history_block = "\n\nRecent conversation:\n"
-        for turn in chat_history[-3:]:
-            history_block += f"User: {turn.get('user', '')}\n"
-            history_block += f"Aisha: {turn.get('aisha', '')}\n"
 
-    system = (
-        f"You are Aisha, a warm, intelligent, and empathetic AI assistant. "
-        f"You adapt your personality based on the role: {role}. "
-        f"The user's name is {name} and they seem to be feeling {emotion}. "
-        f"Keep responses concise (2-3 sentences) unless asked for detail. "
-        f"Respond naturally and helpfully. Do NOT prefix your response with "
-        f"any labels like [Gemini] or [AI]."
-        f"{history_block}"
-    )
-
-    return f"{system}\n\nUser: {user_input}\nAisha:"
+def detect_task(user_input: str) -> TaskType:
+    """Classify *user_input* into a routing task type (heuristic, cheap)."""
+    text = user_input.lower()
+    if any(sig in text for sig in _CODING_SIGNALS):
+        return TaskType.CODING
+    if any(sig in text for sig in _PLANNING_SIGNALS):
+        return TaskType.PLANNING
+    if any(sig in text for sig in _REASONING_SIGNALS):
+        return TaskType.REASONING
+    return TaskType.CONVERSATION
 
 
 # ---------------------------------------------------------------------------
-# Gemini API Call  (with key rotation)
+# Legacy Gemini helpers (delegated to the provider -- kept for compat)
 # ---------------------------------------------------------------------------
 
 def call_gemini_with_rotation(user_input: str, context: dict[str, Any]) -> str | None:
     """
     Call Google Gemini, rotating through all available keys.
 
-    Returns the response text on success, or ``None`` if every key
-    fails or no keys are available.
+    Returns the response text on success, or ``None`` if every key fails or
+    no keys are available.  (Backward-compatible wrapper over GeminiProvider.)
     """
-    if not GEMINI_KEYS:
+    provider = GeminiProvider()
+    if not provider.keys:
         print("  [LLM Router] No valid Gemini keys available.")
         return None
-
-    try:
-        import google.generativeai as genai
-    except ImportError:
-        print("  [LLM Router] google-generativeai package not installed.")
-        return None
-
-    prompt = _build_gemini_prompt(user_input, context)
-
-    for idx, key in enumerate(GEMINI_KEYS):
-        try:
-            genai.configure(api_key=key)
-            model = genai.GenerativeModel("gemini-2.0-flash")
-            response = model.generate_content(prompt)
-            return response.text.strip()
-        except Exception as e:
-            print(f"  [LLM Router] Gemini key #{idx + 1} failed: {e}")
-            continue
-
-    return None
+    result = provider.generate(user_input, context=context)
+    return result.text if result.ok and result.text else None
 
 
 # ---------------------------------------------------------------------------
-# Local Fallback
+# Local Fallback (unchanged behaviour)
 # ---------------------------------------------------------------------------
 
 def _local_response(user_input: str, context: dict[str, Any]) -> str:
-    """
-    Generate a response using the local rule-based response_generator.
-
-    Cost-free and instant -- used for simple queries AND as the
-    ultimate fallback when Gemini fails.
-    """
+    """Generate a response using the offline rule-based response_generator."""
     from response_generator import generate_response
     role = context.get("role", "assistant")
     return generate_response(user_input, role).response
 
 
 # ---------------------------------------------------------------------------
-# Main Entry Point
+# Main Entry Point (backward-compatible signature)
 # ---------------------------------------------------------------------------
 
 def generate_ai_response(
     user_input: str,
     context: dict[str, Any] | None = None,
+    *,
+    task: TaskType | str | None = None,
+    provider: str | None = None,
 ) -> str:
     """
     Route *user_input* through the two-tier system.
 
-    1. Simple query  -->  local response (no API cost).
-    2. Complex query  -->  Gemini API.
-    3. Gemini fails   -->  local response fallback.
+    1. Simple query  -->  local response (no model call).
+    2. Complex query -->  provider registry (Ollama -> Gemini -> local).
 
-    Parameters
-    ----------
-    user_input : str
-        Raw text from the user.
-    context : dict, optional
-        Metadata (``user_name``, ``emotion``, ``role``, ``chat_history``).
-
-    Returns
-    -------
-    str
-        Natural response text (no "[Gemini]" prefix).
+    ``task`` and ``provider`` are optional Phase-9 extras; omitting them
+    preserves the original behaviour exactly.
     """
     if context is None:
         context = {}
@@ -263,165 +203,211 @@ def generate_ai_response(
         print("  [LLM Router] Simple query --> local response.")
         return _local_response(user_input, context)
 
-    # -- Tier 2: Complex query --> Gemini API -----------------------------
-    print("  [LLM Router] Complex query --> calling Gemini.")
-    result = call_gemini_with_rotation(user_input, context)
+    # -- Tier 2: Complex query --> provider registry ----------------------
+    routed_task = task or detect_task(user_input)
+    print(f"  [LLM Router] Complex query --> registry (task={routed_task}).")
+    result = get_registry().generate(
+        user_input,
+        task=routed_task,
+        provider=provider,
+        context=context,
+    )
+    if result.ok and result.text:
+        return result.text
 
-    if result:
-        return result
-
-    # -- Fallback: Gemini failed --> local response -----------------------
-    print("  [LLM Router] Gemini failed --> using local fallback.")
+    # -- Ultimate fallback ------------------------------------------------
+    print("  [LLM Router] Registry produced nothing --> local fallback.")
     return _local_response(user_input, context)
 
 
 # ---------------------------------------------------------------------------
-# Streaming Entry Point (SSE-compatible generator)
+# Streaming Entry Point (SSE-compatible generator, backward-compatible)
 # ---------------------------------------------------------------------------
 
 def generate_ai_response_stream(
     user_input: str,
     context: dict[str, Any] | None = None,
-):
+    *,
+    task: TaskType | str | None = None,
+    provider: str | None = None,
+) -> Iterator[str]:
     """
     Stream *user_input* through the two-tier system, yielding text chunks.
 
-    Yields str chunks as they arrive from Gemini's streaming API.
-    For simple queries, yields the full local response as a single chunk.
-
-    Usage::
-
-        for chunk in generate_ai_response_stream(user_input, context):
-            send_sse(chunk)
-
-    Parameters
-    ----------
-    user_input : str
-        Raw text from the user.
-    context : dict, optional
-        Metadata (``user_name``, ``emotion``, ``role``, ``chat_history``).
-
-    Yields
-    ------
-    str
-        Text chunks.
+    Simple queries yield the full local response as one chunk; complex queries
+    stream from the routed provider, falling back to a single local chunk.
     """
     if context is None:
         context = {}
 
-    # -- Tier 1: Simple query --> local response (single chunk) -----------
     if is_simple_query(user_input):
         print("  [LLM Router] Simple query --> local response (stream).")
         yield _local_response(user_input, context)
         return
 
-    # -- Tier 2: Complex query --> Gemini Streaming API -------------------
-    if GEMINI_KEYS:
-        try:
-            import google.generativeai as genai
-        except ImportError:
-            print("  [LLM Router] google-generativeai package not installed.")
-            yield _local_response(user_input, context)
-            return
-
-        prompt = _build_gemini_prompt(user_input, context)
-
-        for idx, key in enumerate(GEMINI_KEYS):
-            try:
-                genai.configure(api_key=key)
-                model = genai.GenerativeModel("gemini-2.0-flash")
-                response = model.generate_content(prompt, stream=True)
-
-                for chunk in response:
-                    if chunk.text:
-                        yield chunk.text
-                return  # success — exit after first working key
-            except Exception as e:
-                print(f"  [LLM Router] Gemini streaming key #{idx + 1} failed: {e}")
-                continue
-
-    # -- Fallback: Gemini failed --> local response -----------------------
-    print("  [LLM Router] Gemini streaming failed --> local fallback.")
-    yield _local_response(user_input, context)
+    routed_task = task or detect_task(user_input)
+    produced = False
+    for chunk in get_registry().generate_stream(
+        user_input, task=routed_task, provider=provider, context=context,
+    ):
+        if chunk:
+            produced = True
+            yield chunk
+    if not produced:
+        print("  [LLM Router] Registry stream empty --> local fallback.")
+        yield _local_response(user_input, context)
 
 
 # ---------------------------------------------------------------------------
-# Diagnostics
+# Singleton Facade (Phase 9 -- object API used by reflective_cognition)
+# ---------------------------------------------------------------------------
+
+class _LLMRouter:
+    """Object facade over the module functions and the provider registry."""
+
+    @property
+    def registry(self):
+        return get_registry()
+
+    def generate_ai_response(
+        self,
+        user_input: str,
+        context: dict[str, Any] | None = None,
+        *,
+        system_prompt: str | None = None,
+        task: TaskType | str | None = None,
+        provider: str | None = None,
+    ) -> str:
+        """
+        Generate a response, optionally with an explicit *system_prompt*.
+
+        Previously this call site existed in the codebase but referenced a
+        non-existent object and unsupported kwarg (it silently failed).  It is
+        now real: with a system prompt we bypass the simple-query shortcut and
+        route straight through the registry.
+        """
+        if context is None:
+            context = {}
+        if system_prompt is None and is_simple_query(user_input):
+            return _local_response(user_input, context)
+        routed_task = task or detect_task(user_input)
+        result = get_registry().generate(
+            user_input,
+            task=routed_task,
+            provider=provider,
+            system_prompt=system_prompt,
+            context=context,
+        )
+        if result.ok and result.text:
+            return result.text
+        return _local_response(user_input, context)
+
+    def generate_stream(self, *args, **kwargs) -> Iterator[str]:
+        return generate_ai_response_stream(*args, **kwargs)
+
+    def explain_routing(self, user_input: str) -> dict[str, Any]:
+        return explain_routing(user_input)
+
+    def health(self, *, force: bool = False) -> dict[str, Any]:
+        return get_registry().health_report(force=force)
+
+
+#: Module-level singleton (``from llm_router import llm_router``).
+llm_router = _LLMRouter()
+
+
+# ---------------------------------------------------------------------------
+# Diagnostics (backward-compatible + enriched)
 # ---------------------------------------------------------------------------
 
 def get_api_status() -> dict[str, str]:
-    """Return Gemini key availability."""
-    if not GEMINI_KEYS:
-        return {"gemini": "NO_KEYS"}
-    count = len(GEMINI_KEYS)
-    return {"gemini": f"LIVE ({count} key{'s' if count > 1 else ''})"}
+    """
+    Return Gemini key availability (legacy key preserved) plus a summary of
+    all providers' health.
+    """
+    keys = _load_gemini_keys()
+    if not keys:
+        gemini = "NO_KEYS"
+    else:
+        count = len(keys)
+        gemini = f"LIVE ({count} key{'s' if count > 1 else ''})"
+
+    status: dict[str, str] = {"gemini": gemini}
+    try:
+        for name, report in get_registry().health_report().items():
+            status[name] = report["status"].upper()
+    except Exception:
+        pass
+    return status
 
 
-def explain_routing(user_input: str) -> dict[str, str | None]:
-    """Show how *user_input* would be routed without actually calling APIs."""
+def explain_routing(user_input: str) -> dict[str, Any]:
+    """
+    Show how *user_input* would be routed without calling any model.
+
+    Backward-compatible keys ``tier``, ``reason`` and ``input_preview`` are
+    preserved; Phase-9 fields ``provider``, ``model`` and ``task`` are added.
+    """
     if is_simple_query(user_input):
         return {
             "tier": "local",
             "reason": "simple_query",
             "input_preview": user_input[:80],
+            "provider": "local",
+            "model": "rule-based",
+            "task": "conversation",
         }
+
+    task = detect_task(user_input)
+    decision = get_registry().route(task)
     return {
+        # legacy label: complex queries historically reported "gemini"
         "tier": "gemini",
-        "reason": "complex_query",
+        "reason": decision.reason,
         "input_preview": user_input[:80],
+        "provider": decision.provider,
+        "model": decision.model,
+        "task": task.value,
     }
 
 
 # ---------------------------------------------------------------------------
-# Built-in Tests
+# Built-in Tests / Demo
 # ---------------------------------------------------------------------------
 
-def _run_tests() -> None:
-    """Demonstrate routing logic and key status."""
-
+def _run_tests() -> None:  # pragma: no cover - manual demo
+    """Demonstrate routing logic and provider status."""
     test_cases = [
-        # Simple --> local (no API)
-        ("hi",                                       "LOCAL"),
-        ("hello",                                    "LOCAL"),
-        ("thanks",                                   "LOCAL"),
-        ("ok",                                       "LOCAL"),
-        ("good morning",                             "LOCAL"),
-        ("lol",                                      "LOCAL"),
-        ("how are you",                              "LOCAL"),
-        # Complex --> Gemini
+        ("hi", "LOCAL"), ("hello", "LOCAL"), ("thanks", "LOCAL"),
+        ("ok", "LOCAL"), ("good morning", "LOCAL"), ("lol", "LOCAL"),
+        ("how are you", "LOCAL"),
         ("Write a Python function for binary search", "GEMINI"),
-        ("Explain why the sky is blue",               "GEMINI"),
-        ("What is machine learning?",                 "GEMINI"),
-        ("Teach me about recursion step by step",     "GEMINI"),
-        ("What's the weather like today?",            "GEMINI"),
+        ("Explain why the sky is blue", "GEMINI"),
+        ("What is machine learning?", "GEMINI"),
+        ("Teach me about recursion step by step", "GEMINI"),
+        ("What's the weather like today?", "GEMINI"),
     ]
 
     status = get_api_status()
-
     print("=" * 70)
-    print("  AISHA -- LLM Router (Gemini + Local) -- Test Suite")
+    print("  AISHA -- LLM Router (Provider Platform) -- Test Suite")
     print("=" * 70)
     print(f"\n  .env loaded from : {_ENV_PATH}")
-    print(f"  Gemini keys      : {status['gemini']}")
+    print(f"  Provider status  : {status}")
     print()
 
     context = {"user_name": "Mayank", "emotion": "curious", "role": "assistant"}
-
     for user_input, expected_tier in test_cases:
         routing = explain_routing(user_input)
         actual_tier = routing["tier"].upper()
         match = "OK" if actual_tier == expected_tier else "MISMATCH"
-
         print(f"  Input    : \"{user_input}\"")
-        print(f"  Expected : {expected_tier}")
-        print(f"  Actual   : {actual_tier}  [{match}]")
-
+        print(f"  Expected : {expected_tier}  Actual: {actual_tier}  [{match}]")
+        print(f"  Route    : {routing['provider']}/{routing['model']} ({routing['reason']})")
         response = generate_ai_response(user_input, context)
         print(f"  Response : {response[:120]}...")
         print("  " + "-" * 66)
-        print()
-
-    print("  All tests completed.")
+    print("\n  All tests completed.")
     print("=" * 70)
 
 
